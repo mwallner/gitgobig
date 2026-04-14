@@ -443,6 +443,10 @@ detached
         worktree_add(&bare, &wt_path, &default_branch, None).unwrap();
         assert!(wt_path.join("file.txt").exists());
 
+        // Canonicalize so the path matches what git reports (e.g. macOS
+        // /tmp -> /private/tmp, Windows casing differences).
+        let wt_path = wt_path.canonicalize().unwrap();
+
         // List should include the worktree.
         let wts = worktree_list(&bare).unwrap();
         assert!(wts.iter().any(|w| w.path == wt_path));
@@ -462,6 +466,9 @@ detached
 
         let wt_path = _dir.path().join("wt-new-branch");
         worktree_add(&bare, &wt_path, &default_branch, Some("my-feature")).unwrap();
+
+        // Canonicalize so the path matches what git reports.
+        let wt_path = wt_path.canonicalize().unwrap();
 
         // The new worktree should be on the new branch.
         let wts = worktree_list(&bare).unwrap();
