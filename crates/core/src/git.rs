@@ -250,6 +250,17 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// Canonicalize a path and strip the Windows `\\?\` extended-length prefix
+    /// so it matches the regular paths that git outputs.
+    fn normalize_path(p: &Path) -> PathBuf {
+        let canon = p.canonicalize().unwrap();
+        let s = canon.to_string_lossy();
+        match s.strip_prefix(r"\\?\") {
+            Some(stripped) => PathBuf::from(stripped),
+            None => canon,
+        }
+    }
+
     // -- check_git_installed ------------------------------------------------
 
     #[test]
@@ -443,9 +454,9 @@ detached
         worktree_add(&bare, &wt_path, &default_branch, None).unwrap();
         assert!(wt_path.join("file.txt").exists());
 
-        // Canonicalize so the path matches what git reports (e.g. macOS
-        // /tmp -> /private/tmp, Windows casing differences).
-        let wt_path = wt_path.canonicalize().unwrap();
+        // Normalize so the path matches what git reports (macOS symlinks,
+        // Windows \\?\ extended-length prefix).
+        let wt_path = normalize_path(&wt_path);
 
         // List should include the worktree.
         let wts = worktree_list(&bare).unwrap();
@@ -467,8 +478,8 @@ detached
         let wt_path = _dir.path().join("wt-new-branch");
         worktree_add(&bare, &wt_path, &default_branch, Some("my-feature")).unwrap();
 
-        // Canonicalize so the path matches what git reports.
-        let wt_path = wt_path.canonicalize().unwrap();
+        // Normalize so the path matches what git reports.
+        let wt_path = normalize_path(&wt_path);
 
         // The new worktree should be on the new branch.
         let wts = worktree_list(&bare).unwrap();
