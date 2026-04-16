@@ -3,7 +3,7 @@ mod async_git;
 use std::path::PathBuf;
 
 use iced::widget::{
-    button, column, container, pick_list, row, rule, scrollable, text, text_input,
+    button, column, container, row, rule, scrollable, text, text_input,
     toggler, Column,
 };
 use iced::{Element, Fill, Task, Theme};
@@ -55,6 +55,7 @@ struct DashboardState {
     // Worktree creation form
     wt_path_input: String,
     wt_branch: Option<String>,
+    wt_branch_filter: String,
     wt_new_branch_toggle: bool,
     wt_new_branch_name: String,
     // Cached data
@@ -93,6 +94,7 @@ enum Message {
     WtPathChanged(String),
     PickWtDir,
     WtDirPicked(Option<PathBuf>),
+    WtBranchFilterChanged(String),
     WtBranchSelected(String),
     WtNewBranchToggled(bool),
     WtNewBranchNameChanged(String),
@@ -158,6 +160,7 @@ impl App {
                     syncing: false,
                     wt_path_input: String::new(),
                     wt_branch: None,
+                    wt_branch_filter: String::new(),
                     wt_new_branch_toggle: false,
                     wt_new_branch_name: String::new(),
                     branches: Vec::new(),
@@ -339,8 +342,15 @@ impl App {
                 }
                 Task::none()
             }
+            Message::WtBranchFilterChanged(f) => {
+                if let Screen::Dashboard(d) = &mut self.screen {
+                    d.wt_branch_filter = f;
+                }
+                Task::none()
+            }
             Message::WtBranchSelected(b) => {
                 if let Screen::Dashboard(d) = &mut self.screen {
+                    d.wt_branch_filter = b.clone();
                     d.wt_branch = Some(b);
                 }
                 Task::none()
@@ -390,6 +400,7 @@ impl App {
                             d.wt_path_input.clear();
                             d.wt_new_branch_name.clear();
                             d.wt_new_branch_toggle = false;
+                            d.wt_branch_filter.clear();
                             return self.update(Message::RefreshWorktrees);
                         }
                         Err(e) => self.set_error("Failed to add worktree", Some(e)),
@@ -505,7 +516,7 @@ impl App {
 
     // -- Dashboard view -----------------------------------------------------
 
-    fn view_dashboard(&self, d: &DashboardState) -> Element<'_, Message> {
+    fn view_dashboard<'a>(&'a self, d: &'a DashboardState) -> Element<'a, Message> {
         let repo = &self.state.repositories[d.repo_index];
 
         let header = column![
@@ -544,7 +555,7 @@ impl App {
         .into()
     }
 
-    fn view_worktree_list(&self, d: &DashboardState) -> Element<'_, Message> {
+    fn view_worktree_list<'a>(&'a self, d: &'a DashboardState) -> Element<'a, Message> {
         if d.loading_worktrees {
             return text("Loading…").into();
         }
@@ -588,14 +599,48 @@ impl App {
         Column::with_children(rows).spacing(4).into()
     }
 
-    fn view_worktree_create(&self, d: &DashboardState) -> Element<'_, Message> {
-        let branch_picker: Element<'_, Message> = pick_list(
-            d.branches.clone(),
-            d.wt_branch.clone(),
-            Message::WtBranchSelected,
+    fn view_worktree_create<'a>(&'a self, d: &'a DashboardState) -> Element<'a, Message> {
+        let filter_lower = d.wt_branch_filter.to_lowercase();
+        let filtered_branches: Vec<&String> = if filter_lower.is_empty() {
+            d.branches.iter().collect()
+        } else {
+            d.branches
+                .iter()
+                .filter(|b| b.to_lowercase().contains(&filter_lower))
+                .collect()
+        };
+
+        let branch_items: Vec<Element<'_, Message>> = filtered_branches
+            .into_iter()
+            .map(|b| {
+                let is_selected = d.wt_branch.as_ref() == Some(b);
+                let label = if is_selected {
+                    text(format!("✓ {b}")).size(13)
+                } else {
+                    text(b.as_str()).size(13)
+                };
+                button(label)
+                    .on_press(Message::WtBranchSelected(b.clone()))
+                    .width(Fill)
+                    .style(if is_selected {
+                        button::primary
+                    } else {
+                        button::secondary
+                    })
+                    .padding(4)
+                    .into()
+            })
+            .collect();
+
+        let branch_list = container(
+            scrollable(Column::with_children(branch_items).spacing(2))
         )
-        .placeholder("Select branch")
-        .into();
+        .height(150);
+
+        let selected_label: Element<'_, Message> = match &d.wt_branch {
+            Some(b) => text(format!("Selected: {b}")).size(13).into(),
+            None => text("No branch selected").size(13).into(),
+        };
 
         let mut form = column![
             row![
@@ -606,7 +651,12 @@ impl App {
                 button("Browse…").on_press(Message::PickWtDir),
             ]
             .spacing(8),
-            branch_picker,
+            text("Branch").size(14),
+            text_input("Filter branches…", &d.wt_branch_filter)
+                .on_input(Message::WtBranchFilterChanged)
+                .padding(8),
+            branch_list,
+            selected_label,
             toggler(d.wt_new_branch_toggle)
                 .label("Create new branch")
                 .on_toggle(Message::WtNewBranchToggled),
