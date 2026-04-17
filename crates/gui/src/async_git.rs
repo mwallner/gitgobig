@@ -1,184 +1,296 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
+use iced::futures::SinkExt;
+use iced::futures::channel::mpsc;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-use gitgobig_core::Worktree;
+use gitgobig_core::{Worktree, git};
 
-/// Run a git command asynchronously via `tokio::process::Command`.
-async fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<String> {
+/// Events emitted by streaming git operations.
+#[derive(Debug, Clone)]
+pub enum GitEvent {
+    /// A line of output (stdout or stderr) from the git process.
+    Output(String),
+    /// The operation completed successfully (with optional result payload).
+    Done(GitResult),
+    /// The operation failed.
+    Failed(String),
+}
+
+/// Typed result payloads for different git operations.
+#[derive(Debug, Clone)]
+pub enum GitResult {
+    CloneDone,
+    SyncDone(String),
+    WorktreeAddDone,
+    WorktreeRemoveDone,
+}
+
+// ---------------------------------------------------------------------------
+// Streaming runner (spawns git, pipes output line by line)
+// ---------------------------------------------------------------------------
+
+/// Run a git command, streaming stdout and stderr lines through the sender.
+/// Returns the full stdout on success, or an error.
+async fn run_git_streaming(
+    args: &[&str],
+    cwd: Option<&Path>,
+    tx: &mut mpsc::Sender<GitEvent>,
+) -> Result<String> {
     let mut cmd = Command::new("git");
     cmd.args(args);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
-    let output = cmd.output().await.context("failed to execute git")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn()?;
+
+    // Show the command being run
+    let cmd_line = format!("$ git {}", args.join(" "));
+    let _ = tx.send(GitEvent::Output(cmd_line)).await;
+
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+
+    let mut stdout_reader = BufReader::new(stdout).lines();
+    let mut stderr_reader = BufReader::new(stderr).lines();
+
+    let mut full_stdout = String::new();
+    let mut full_stderr = String::new();
+
+    // Read both streams concurrently until both are done.
+    loop {
+        tokio::select! {
+            line = stdout_reader.next_line() => {
+                match line {
+                    Ok(Some(l)) => {
+                        if !full_stdout.is_empty() {
+                            full_stdout.push('\n');
+                        }
+                        full_stdout.push_str(&l);
+                        let _ = tx.send(GitEvent::Output(l)).await;
+                    }
+                    Ok(None) => {
+                        // stdout closed — wait for stderr to finish, then break
+                        while let Ok(Some(l)) = stderr_reader.next_line().await {
+                            if !full_stderr.is_empty() {
+                                full_stderr.push('\n');
+                            }
+                            full_stderr.push_str(&l);
+                            let _ = tx.send(GitEvent::Output(l)).await;
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(GitEvent::Output(format!("[read error: {e}]"))).await;
+                        break;
+                    }
+                }
+            }
+            line = stderr_reader.next_line() => {
+                match line {
+                    Ok(Some(l)) => {
+                        if !full_stderr.is_empty() {
+                            full_stderr.push('\n');
+                        }
+                        full_stderr.push_str(&l);
+                        let _ = tx.send(GitEvent::Output(l)).await;
+                    }
+                    Ok(None) => {
+                        // stderr closed — drain remaining stdout, then break
+                        while let Ok(Some(l)) = stdout_reader.next_line().await {
+                            if !full_stdout.is_empty() {
+                                full_stdout.push('\n');
+                            }
+                            full_stdout.push_str(&l);
+                            let _ = tx.send(GitEvent::Output(l)).await;
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(GitEvent::Output(format!("[read error: {e}]"))).await;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let status = child.wait().await?;
+    if !status.success() {
+        anyhow::bail!(
             "git {} failed: {}",
             args.first().unwrap_or(&""),
-            stderr.trim()
+            full_stderr.trim()
         );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(full_stdout)
 }
 
-pub async fn clone_bare(url: String, dest: PathBuf) -> Result<()> {
-    if dest.exists() {
-        bail!("destination already exists: {}", dest.display());
-    }
-    let dest_str = dest
-        .to_str()
-        .context("destination path is not valid UTF-8")?
-        .to_string();
-    run_git(
-        &["clone", "--bare", "--filter=blob:none", &url, &dest_str],
-        None,
-    )
-    .await?;
-    Ok(())
+// ---------------------------------------------------------------------------
+// Streaming public API (return iced::stream channels)
+// ---------------------------------------------------------------------------
+
+pub fn clone_bare_stream(
+    url: String,
+    dest: PathBuf,
+) -> impl iced::futures::Stream<Item = GitEvent> {
+    iced::stream::channel(32, async move |mut tx| {
+        // Validate before spawning
+        if dest.exists() {
+            let _ = tx
+                .send(GitEvent::Failed(format!(
+                    "destination already exists: {}",
+                    dest.display()
+                )))
+                .await;
+            return;
+        }
+        let dest_str = match dest.to_str() {
+            Some(s) => s.to_string(),
+            None => {
+                let _ = tx
+                    .send(GitEvent::Failed(
+                        "destination path is not valid UTF-8".into(),
+                    ))
+                    .await;
+                return;
+            }
+        };
+
+        match run_git_streaming(
+            &[
+                "clone",
+                "--bare",
+                "--filter=blob:none",
+                "--progress",
+                &url,
+                &dest_str,
+            ],
+            None,
+            &mut tx,
+        )
+        .await
+        {
+            Ok(_) => {
+                let _ = tx.send(GitEvent::Done(GitResult::CloneDone)).await;
+            }
+            Err(e) => {
+                let _ = tx.send(GitEvent::Failed(e.to_string())).await;
+            }
+        }
+    })
 }
 
-pub async fn sync(repo_path: PathBuf) -> Result<String> {
-    run_git(&["fetch", "--all", "--prune"], Some(&repo_path)).await
+pub fn sync_stream(repo_path: PathBuf) -> impl iced::futures::Stream<Item = GitEvent> {
+    iced::stream::channel(32, async move |mut tx| {
+        match run_git_streaming(
+            &["fetch", "--all", "--prune", "--progress"],
+            Some(&repo_path),
+            &mut tx,
+        )
+        .await
+        {
+            Ok(stdout) => {
+                let _ = tx.send(GitEvent::Done(GitResult::SyncDone(stdout))).await;
+            }
+            Err(e) => {
+                let _ = tx.send(GitEvent::Failed(e.to_string())).await;
+            }
+        }
+    })
 }
 
-pub async fn worktree_add(
+pub fn worktree_add_stream(
     repo_path: PathBuf,
     worktree_path: PathBuf,
     branch: String,
     new_branch: Option<String>,
-) -> Result<()> {
-    if worktree_path.exists() {
-        bail!(
-            "worktree target directory already exists: {}",
-            worktree_path.display()
-        );
-    }
-    let wt_str = worktree_path
-        .to_str()
-        .context("worktree path is not valid UTF-8")?
-        .to_string();
+) -> impl iced::futures::Stream<Item = GitEvent> {
+    iced::stream::channel(32, async move |mut tx| {
+        if worktree_path.exists() {
+            let _ = tx
+                .send(GitEvent::Failed(format!(
+                    "worktree target directory already exists: {}",
+                    worktree_path.display()
+                )))
+                .await;
+            return;
+        }
+        let wt_str = match worktree_path.to_str() {
+            Some(s) => s.to_string(),
+            None => {
+                let _ = tx
+                    .send(GitEvent::Failed("worktree path is not valid UTF-8".into()))
+                    .await;
+                return;
+            }
+        };
 
-    match new_branch {
-        Some(ref name) => {
-            run_git(
-                &["worktree", "add", "-b", name, &wt_str, &branch],
-                Some(&repo_path),
-            )
-            .await?;
+        let args: Vec<String> = match &new_branch {
+            Some(name) => vec![
+                "worktree".into(),
+                "add".into(),
+                "-b".into(),
+                name.clone(),
+                wt_str,
+                branch,
+            ],
+            None => vec!["worktree".into(), "add".into(), wt_str, branch],
+        };
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+        match run_git_streaming(&arg_refs, Some(&repo_path), &mut tx).await {
+            Ok(_) => {
+                let _ = tx.send(GitEvent::Done(GitResult::WorktreeAddDone)).await;
+            }
+            Err(e) => {
+                let _ = tx.send(GitEvent::Failed(e.to_string())).await;
+            }
         }
-        None => {
-            run_git(
-                &["worktree", "add", &wt_str, &branch],
-                Some(&repo_path),
-            )
-            .await?;
-        }
-    }
-    Ok(())
+    })
 }
+
+pub fn worktree_remove_stream(
+    repo_path: PathBuf,
+    worktree_path: PathBuf,
+) -> impl iced::futures::Stream<Item = GitEvent> {
+    iced::stream::channel(32, async move |mut tx| {
+        let wt_str = match worktree_path.to_str() {
+            Some(s) => s.to_string(),
+            None => {
+                let _ = tx
+                    .send(GitEvent::Failed("worktree path is not valid UTF-8".into()))
+                    .await;
+                return;
+            }
+        };
+
+        match run_git_streaming(&["worktree", "remove", &wt_str], Some(&repo_path), &mut tx).await {
+            Ok(_) => {
+                // Also prune
+                let _ = run_git_streaming(&["worktree", "prune"], Some(&repo_path), &mut tx).await;
+                let _ = tx.send(GitEvent::Done(GitResult::WorktreeRemoveDone)).await;
+            }
+            Err(e) => {
+                let _ = tx.send(GitEvent::Failed(e.to_string())).await;
+            }
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Non-streaming helpers (keep for lightweight queries)
+// ---------------------------------------------------------------------------
 
 pub async fn worktree_list(repo_path: PathBuf) -> Result<Vec<Worktree>> {
-    let output = run_git(&["worktree", "list", "--porcelain"], Some(&repo_path)).await?;
-    Ok(parse_worktree_porcelain(&output))
-}
-
-pub async fn worktree_remove(repo_path: PathBuf, worktree_path: PathBuf) -> Result<()> {
-    let wt_str = worktree_path
-        .to_str()
-        .context("worktree path is not valid UTF-8")?
-        .to_string();
-    run_git(&["worktree", "remove", &wt_str], Some(&repo_path)).await?;
-    run_git(&["worktree", "prune"], Some(&repo_path)).await?;
-    Ok(())
+    tokio::task::spawn_blocking(move || git::worktree_list(&repo_path)).await?
 }
 
 pub async fn branch_list(repo_path: PathBuf) -> Result<Vec<String>> {
-    let output = run_git(&["branch", "-a"], Some(&repo_path)).await?;
-    Ok(parse_branch_list(&output))
-}
-
-fn parse_worktree_porcelain(output: &str) -> Vec<Worktree> {
-    let mut worktrees = Vec::new();
-    let mut path: Option<PathBuf> = None;
-    let mut commit: Option<String> = None;
-    let mut branch: Option<String> = None;
-
-    for line in output.lines() {
-        if let Some(p) = line.strip_prefix("worktree ") {
-            if let Some(prev_path) = path.take() {
-                worktrees.push(Worktree {
-                    path: prev_path,
-                    branch: branch.take(),
-                    commit: commit.take(),
-                });
-            }
-            path = Some(PathBuf::from(p));
-            commit = None;
-            branch = None;
-        } else if let Some(h) = line.strip_prefix("HEAD ") {
-            commit = Some(h.to_string());
-        } else if let Some(b) = line.strip_prefix("branch ") {
-            branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
-        }
-    }
-
-    if let Some(p) = path {
-        worktrees.push(Worktree {
-            path: p,
-            branch: branch.take(),
-            commit: commit.take(),
-        });
-    }
-
-    worktrees
-}
-
-fn parse_branch_list(output: &str) -> Vec<String> {
-    output
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim().trim_start_matches("* ");
-            if trimmed.is_empty() || trimmed.contains(" -> ") {
-                return None;
-            }
-            Some(trimmed.to_string())
-        })
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_worktree_porcelain_parses_entries() {
-        let input = "\
-worktree /repos/project.git
-HEAD abc123
-branch refs/heads/main
-bare
-
-worktree /work/feature
-HEAD def456
-branch refs/heads/feature
-";
-        let wts = parse_worktree_porcelain(input);
-        assert_eq!(wts.len(), 2);
-        assert_eq!(wts[0].branch.as_deref(), Some("main"));
-        assert_eq!(wts[1].branch.as_deref(), Some("feature"));
-    }
-
-    #[test]
-    fn parse_branch_list_filters_symbolic_refs() {
-        let input = "\
-* main
-  remotes/origin/HEAD -> origin/main
-  remotes/origin/main
-";
-        let branches = parse_branch_list(input);
-        assert_eq!(branches, vec!["main", "remotes/origin/main"]);
-    }
+    tokio::task::spawn_blocking(move || git::branch_list(&repo_path)).await?
 }

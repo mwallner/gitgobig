@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -20,8 +20,13 @@ enum Commands {
     Clone {
         /// Remote URL to clone
         url: String,
-        /// Local directory for the bare clone
-        dest: PathBuf,
+        /// Local directory for the bare clone (auto-computed if default dir is set)
+        dest: Option<PathBuf>,
+    },
+    /// Add an existing local bare repository to tracking
+    Add {
+        /// Path to the bare repository
+        path: PathBuf,
     },
     /// Fetch all remotes and prune stale branches in a tracked repo
     Sync {
@@ -31,6 +36,22 @@ enum Commands {
     /// Worktree operations
     #[command(subcommand)]
     Worktree(WorktreeCmd),
+    /// Configuration management
+    #[command(subcommand)]
+    Config(ConfigCmd),
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Set the default base directory for cloned repositories
+    SetDefaultDir {
+        /// Path to the default directory
+        path: PathBuf,
+    },
+    /// Show the current default repository directory
+    GetDefaultDir,
+    /// Clear the default repository directory
+    ClearDefaultDir,
 }
 
 #[derive(Subcommand)]
@@ -66,7 +87,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Clone { url, dest } => cmd_clone(&url, &dest),
+        Commands::Clone { url, dest } => cmd_clone(&url, dest.as_deref()),
+        Commands::Add { path } => cmd_add(&path),
         Commands::Sync { name } => cmd_sync(&name),
         Commands::Worktree(wt) => match wt {
             WorktreeCmd::Add {
@@ -78,24 +100,39 @@ fn main() -> Result<()> {
             WorktreeCmd::List { repo } => cmd_worktree_list(&repo),
             WorktreeCmd::Remove { repo, path } => cmd_worktree_remove(&repo, &path),
         },
+        Commands::Config(cfg) => match cfg {
+            ConfigCmd::SetDefaultDir { path } => cmd_config_set_default_dir(&path),
+            ConfigCmd::GetDefaultDir => cmd_config_get_default_dir(),
+            ConfigCmd::ClearDefaultDir => cmd_config_clear_default_dir(),
+        },
     }
 }
 
-fn cmd_clone(url: &str, dest: &PathBuf) -> Result<()> {
+fn cmd_clone(url: &str, dest: Option<&Path>) -> Result<()> {
+    let dest = match dest {
+        Some(d) => d.to_path_buf(),
+        None => {
+            let state = load_state()?;
+            let base = state
+                .default_repo_dir
+                .as_ref()
+                .context("no destination provided and no default repository directory configured (use `config set-default-dir`)")?;
+            let name = git::repo_name_from_url(url);
+            if name.is_empty() {
+                bail!("could not derive repository name from URL");
+            }
+            base.join(&name).join(format!("{name}_bare"))
+        }
+    };
     println!("Cloning {} into {} …", url, dest.display());
-    git::clone_bare(url, dest)?;
+    git::clone_bare(url, &dest)?;
 
     // Derive a display name from the URL.
-    let name = url
-        .rsplit('/')
-        .next()
-        .unwrap_or(url)
-        .trim_end_matches(".git")
-        .to_string();
+    let name = git::repo_name_from_url(url);
 
     // Persist the new repo in app state.
     let mut state = load_state()?;
-    if state.repositories.iter().any(|r| r.path == *dest) {
+    if state.repositories.iter().any(|r| r.path == dest) {
         bail!("a repository at {} is already tracked", dest.display());
     }
     state.repositories.push(Repository {
@@ -107,6 +144,38 @@ fn cmd_clone(url: &str, dest: &PathBuf) -> Result<()> {
     save_state(&state)?;
 
     println!("Cloned and tracked as \"{}\"", name);
+    Ok(())
+}
+
+fn cmd_add(path: &Path) -> Result<()> {
+    let path = path.canonicalize().context("path does not exist")?;
+    if !git::is_git_repo(&path) {
+        bail!("{} is not a git repository", path.display());
+    }
+    let is_bare = git::is_bare_repo(&path).unwrap_or(false);
+    let mut state = load_state()?;
+    if state.repositories.iter().any(|r| r.path == path) {
+        bail!("a repository at {} is already tracked", path.display());
+    }
+    let url = git::get_remote_url(&path)?.unwrap_or_default();
+    let name = if !url.is_empty() {
+        git::repo_name_from_url(&url)
+    } else {
+        path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unnamed".into())
+    };
+    state.repositories.push(Repository {
+        name: name.clone(),
+        path: path.clone(),
+        url,
+        worktrees: vec![],
+    });
+    save_state(&state)?;
+    println!("Tracked \"{}\" at {}", name, path.display());
+    if !is_bare {
+        println!("Note: this is not a bare repository. Worktree management features may not work as expected.");
+    }
     Ok(())
 }
 
@@ -176,6 +245,31 @@ fn cmd_worktree_remove(repo_name: &str, path: &PathBuf) -> Result<()> {
     save_state(&state)?;
 
     println!("Worktree removed: {}", path.display());
+    Ok(())
+}
+
+fn cmd_config_set_default_dir(path: &Path) -> Result<()> {
+    let mut state = load_state()?;
+    state.default_repo_dir = Some(path.to_path_buf());
+    save_state(&state)?;
+    println!("Default repository directory set to: {}", path.display());
+    Ok(())
+}
+
+fn cmd_config_get_default_dir() -> Result<()> {
+    let state = load_state()?;
+    match &state.default_repo_dir {
+        Some(dir) => println!("{}", dir.display()),
+        None => println!("(not configured)"),
+    }
+    Ok(())
+}
+
+fn cmd_config_clear_default_dir() -> Result<()> {
+    let mut state = load_state()?;
+    state.default_repo_dir = None;
+    save_state(&state)?;
+    println!("Default repository directory cleared.");
     Ok(())
 }
 

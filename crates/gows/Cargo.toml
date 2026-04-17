@@ -1,0 +1,16 @@
+[package]
+name = "gitgows"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "gitgows"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+clap.workspace = true
+iced = { workspace = true, features = ["tokio", "canvas"] }
+gitgobig-core.workspace = true
+regex = "1"

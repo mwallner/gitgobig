@@ -58,6 +58,7 @@ mod tests {
                 url: "https://example.com/repo.git".into(),
                 worktrees: vec![],
             }],
+            default_repo_dir: None,
         };
 
         // Write

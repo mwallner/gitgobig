@@ -26,8 +26,30 @@ pub struct Worktree {
     pub commit: Option<String>,
 }
 
+/// A single commit from `git log` output.
+#[derive(Debug, Clone)]
+pub struct CommitEntry {
+    /// Full SHA hash.
+    pub hash: String,
+    /// Abbreviated SHA hash.
+    pub short_hash: String,
+    /// First line of commit message.
+    pub subject: String,
+    /// ISO 8601 author date.
+    pub date: String,
+    /// Author name.
+    pub author: String,
+    /// Decorated ref names (branches, tags).
+    pub refs: String,
+    /// Parent commit hashes (full SHA).
+    pub parents: Vec<String>,
+}
+
 /// Top-level application state persisted to disk.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct AppState {
     pub repositories: Vec<Repository>,
+    /// Default base directory for cloned repositories.
+    #[serde(default)]
+    pub default_repo_dir: Option<PathBuf>,
 }

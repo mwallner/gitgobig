@@ -3,7 +3,7 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-use crate::Worktree;
+use crate::{CommitEntry, Worktree};
 
 // ---------------------------------------------------------------------------
 // Preflight
@@ -154,7 +154,7 @@ pub fn worktree_list(repo_path: &Path) -> Result<Vec<Worktree>> {
 /// HEAD abc123
 /// branch refs/heads/main
 /// ```
-fn parse_worktree_porcelain(output: &str) -> Vec<Worktree> {
+pub fn parse_worktree_porcelain(output: &str) -> Vec<Worktree> {
     let mut worktrees = Vec::new();
     let mut path: Option<PathBuf> = None;
     let mut commit: Option<String> = None;
@@ -227,11 +227,11 @@ pub fn branch_list(repo_path: &Path) -> Result<Vec<String>> {
 }
 
 /// Parse `git branch -a` output into a vec of branch name strings.
-fn parse_branch_list(output: &str) -> Vec<String> {
+pub fn parse_branch_list(output: &str) -> Vec<String> {
     output
         .lines()
         .filter_map(|line| {
-            let trimmed = line.trim().trim_start_matches("* ");
+            let trimmed = line.trim().trim_start_matches("* ").trim_start_matches("+ ");
             if trimmed.is_empty() || trimmed.contains(" -> ") {
                 // Skip empty lines and symbolic refs like `remotes/origin/HEAD -> origin/main`
                 return None;
@@ -239,6 +239,137 @@ fn parse_branch_list(output: &str) -> Vec<String> {
             Some(trimmed.to_string())
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Git Log
+// ---------------------------------------------------------------------------
+
+/// Retrieve a page of commits with parent information.
+///
+/// Runs: `git log --format=<fmt> -n <max_count> --skip=<skip>`
+/// Returns a vec of `CommitEntry` structs.
+pub fn log_graph(repo_path: &Path, max_count: usize, skip: usize) -> Result<Vec<CommitEntry>> {
+    log_graph_branches(repo_path, max_count, skip, &[])
+}
+
+/// Retrieve a page of commits reachable from the given branches.
+///
+/// When `branches` is empty, all refs are included (same as `log_graph`).
+/// When non-empty, only commits reachable from those refs are returned.
+pub fn log_graph_branches(
+    repo_path: &Path,
+    max_count: usize,
+    skip: usize,
+    branches: &[String],
+) -> Result<Vec<CommitEntry>> {
+    // Format: hash\x01parents\x00short_hash\x00subject\x00date\x00author\x00refs
+    let format_arg = "--format=%H%x01%P%x00%h%x00%s%x00%aI%x00%an%x00%D";
+    let count_arg = format!("-n{max_count}");
+    let skip_arg = format!("--skip={skip}");
+    let mut args = vec!["log", format_arg, &count_arg, &skip_arg];
+    let branch_strs: Vec<&str> = branches.iter().map(|s| s.as_str()).collect();
+    args.extend_from_slice(&branch_strs);
+    let output = run_git(&args, Some(repo_path))?;
+    Ok(parse_log_graph(&output))
+}
+
+/// Parse `git log --format=%H%x01%P%x00%h%x00%s%x00%aI%x00%an%x00%D` output.
+pub fn parse_log_graph(output: &str) -> Vec<CommitEntry> {
+    let mut entries = Vec::new();
+    for line in output.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        // Split by first \x01 to get hash and parents+rest
+        let Some(soh_pos) = line.find('\x01') else {
+            continue;
+        };
+        let hash = &line[..soh_pos];
+        if hash.len() != 40 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+
+        let after_soh = &line[soh_pos + 1..];
+        // Split by first \0 to get parents and the remaining fields
+        let Some(nul_pos) = after_soh.find('\0') else {
+            continue;
+        };
+        let parents_str = &after_soh[..nul_pos];
+        let parents: Vec<String> = if parents_str.is_empty() {
+            Vec::new()
+        } else {
+            parents_str.split(' ').map(|s| s.to_string()).collect()
+        };
+
+        // Remaining fields: short_hash\0subject\0date\0author\0refs
+        let rest = &after_soh[nul_pos + 1..];
+        let fields: Vec<&str> = rest.splitn(5, '\0').collect();
+        if fields.len() < 4 {
+            continue;
+        }
+
+        entries.push(CommitEntry {
+            hash: hash.to_string(),
+            parents,
+            short_hash: fields[0].to_string(),
+            subject: fields[1].to_string(),
+            date: fields[2].to_string(),
+            author: fields[3].to_string(),
+            refs: fields.get(4).unwrap_or(&"").to_string(),
+        });
+    }
+    entries
+}
+
+/// Retrieve detailed info for a single commit (`git log -1 --stat`).
+///
+/// Validates that `commit_hash` contains only hex characters to prevent injection.
+pub fn log_detail(repo_path: &Path, commit_hash: &str) -> Result<String> {
+    if !commit_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("invalid commit hash: must contain only hex characters");
+    }
+    run_git(&["log", "-1", "--stat", commit_hash], Some(repo_path))
+}
+
+// ---------------------------------------------------------------------------
+// URL helpers
+// ---------------------------------------------------------------------------
+
+/// Extract a repository name from a URL.
+///
+/// Parses the last path segment and strips the `.git` suffix.
+/// E.g. `https://github.com/user/myrepo.git` → `myrepo`
+pub fn repo_name_from_url(url: &str) -> String {
+    url.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .or_else(|| url.rsplit(':').next())
+        .unwrap_or(url)
+        .trim_end_matches(".git")
+        .to_string()
+}
+
+/// Check whether the given path is inside a git repository (bare or not).
+pub fn is_git_repo(path: &Path) -> bool {
+    run_git(&["rev-parse", "--git-dir"], Some(path)).is_ok()
+}
+
+/// Check whether the given path is a bare git repository.
+pub fn is_bare_repo(path: &Path) -> Result<bool> {
+    let out = run_git(&["rev-parse", "--is-bare-repository"], Some(path))?;
+    Ok(out.trim() == "true")
+}
+
+/// Get the remote "origin" URL, if any.
+pub fn get_remote_url(repo_path: &Path) -> Result<Option<String>> {
+    match run_git(&["config", "--get", "remote.origin.url"], Some(repo_path)) {
+        Ok(url) => {
+            let url = url.trim().to_string();
+            if url.is_empty() { Ok(None) } else { Ok(Some(url)) }
+        }
+        Err(_) => Ok(None),
+    }
 }
 
 // ---------------------------------------------------------------------------
